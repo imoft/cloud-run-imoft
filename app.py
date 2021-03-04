@@ -1,13 +1,53 @@
 from starlette.applications import Starlette
 from starlette.responses import UJSONResponse
+from dotenv import load_dotenv
+from newsapi import NewsApiClient
+import json
+import pprint
 import uvicorn
 import os
 import gc
-
+load_dotenv()
+import requests
 app = Starlette(debug=False)
 
-sess = gpt2.start_tf_sess(threads=1)
-gpt2.load_gpt2(sess)
+import openai
+openai.organization = os.getenv("OPNAI_ORG")
+openai.api_key = os.getenv("KEY")
+
+spacy_url = 'https://imoft-spacy-idvgffrwca-ez.a.run.app'
+
+# Init
+newsapi = NewsApiClient(api_key=os.getenv("NEWS"))
+pprint.pprint("Hello pretty printer")
+
+non_entities = ['EVENT', 'LAW', 'DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL']
+
+
+# /v2/top-headlines
+top_headlines = newsapi.get_top_headlines(language='en', sources="bbc-news,new-york-magazine,new-scientist, national-geographic" )
+# pprint.pprint( newsapi.get_sources())
+newsTexts = []
+for article in top_headlines['articles']:
+    newsTexts.append(article['title'] + "." + article['description'])
+
+
+def generatePrompt(words):
+    i=1
+    output = "Words\n"
+
+    for word in words:
+        output += (str(i) + ". " + "\"" + word + "\"\n")
+        i+=1
+        if i==5:
+            output += "\n Speculative Questions \n 1."
+            return output
+    
+    return output
+
+def parseOutput(output):
+    print(output.split(str="\n", num=5))
+    
 
 # Needed to avoid cross-domain issues
 response_header = {
@@ -19,40 +59,55 @@ generate_count = 0
 
 @app.route('/', methods=['GET', 'POST', 'HEAD'])
 async def homepage(request):
-    global generate_count
-    global sess
+    words = []
 
-    if request.method == 'GET':
-        params = request.query_params
-    elif request.method == 'POST':
-        params = await request.json()
-    elif request.method == 'HEAD':
-        return UJSONResponse({'text': ''},
-                             headers=response_header)
+    query = {'sections': newsTexts, 'sense2vec':False}
+    jsonData = json.dumps(query)
+    r = requests.post(spacy_url+'/ner', json=query)
 
-    text = gpt2.generate(sess,
-                         length=int(params.get('length', 1023)),
-                         temperature=float(params.get('temperature', 0.7)),
-                         top_k=int(params.get('top_k', 0)),
-                         top_p=float(params.get('top_p', 0)),
-                         prefix=params.get('prefix', '')[:500],
-                         truncate=params.get('truncate', None),
-                         include_prefix=str(params.get(
-                             'include_prefix', True)).lower() == 'true',
-                         return_as_list=True
-                         )[0]
+    data = r.json()['data']
 
-    generate_count += 1
-    if generate_count == 8:
-        # Reload model to prevent Graph/Session from going OOM
-        tf.reset_default_graph()
-        sess.close()
-        sess = gpt2.start_tf_sess(threads=1)
-        gpt2.load_gpt2(sess)
-        generate_count = 0
+    namedEntities = []
+    for obj in data:
+        for ent in obj['entities']:
+            
+            if ent['label'] not in non_entities:
+                
+                if ent['text'] not in namedEntities and not any(map(str.isdigit, ent['text'])):
+                    if len(ent['text'])< 30 and len(ent['text'])> 4:
+                        namedEntities.append(ent['text'])
+
+
+    output_qs = ''
+    for i in range(0,3):
+
+        prompt = generatePrompt(namedEntities[i*5: (i+1)*5])
+
+        output = openai.Completion.create(
+        engine="davinci",
+        prompt="This is a speculative question generator.\nQuestion: \"What if taxes could be a prosperous choice ?\"\nWord: taxes\n###\nQuestion: \"What if Baghdad could be a cyberpunk utopia?\"\nWord: Baghdad\n###\nQuestion: \"What if Apple transformed the way we drive?\"\nWord: Apple\n###\nQuestion: \"What if UFOs could be a new form of meditation?\"\nWord: UFO\n###\nQuestion: \"What if Google could be a key player in world peace?\"\nWord: Google\n###\n\nWords:\n1. Taxes\n2. Baghdad\n3. Apple\n4. UFO\n5. Google\n\nSpeculative Questions\n1. \"What if Taxes could be a prosperous choice?\"\n2. \"What if Baghdad could be a cyberpunk utopia?\"\n3. \"What if Apple transformed the way we drive?\"\n4. \"What if UFOs could be a new form of meditation?\"\n5. \"What if Google could be a key player in world peace?\"\n\n###\n\n" + prompt,
+        temperature=0.5,
+        max_tokens=300,
+        top_p=1,
+        frequency_penalty=1,
+        presence_penalty=0.75,
+        stop=["\n\n"]
+        )
+        # pprint.pprint(output['choices'][0]['text'])
+        output_qs += output['choices'][0]['text']
+        
+    query = {'text': output_qs}
+    r = requests.post(spacy_url+'/sentencizer', json=query)
+
+
+    output_sentences = []
+    for sentence in r.json()['sentences']:
+        if "What if" in sentence:
+            pprint.pprint(sentence)
+            output_sentences.append(sentence)
 
     gc.collect()
-    return UJSONResponse({'text': text},
+    return UJSONResponse({'sentences': output_sentences},
                          headers=response_header)
 
 if __name__ == '__main__':
